@@ -1435,9 +1435,8 @@ function openServerActionsMenu(){
   const content = document.createElement('div'); content.className='modal-content';
   const list = document.createElement('div'); list.className='modal-list';
   const b1 = document.createElement('button'); b1.className='modal-item'; b1.textContent='Back up local files to server'; b1.onclick=async()=>{ close(); await backupAllToServer(); };
-  const b2 = document.createElement('button'); b2.className='modal-item'; b2.textContent='Load from server'; b2.onclick=()=>{ close(); openServerLoadModal(); };
-  const b3 = document.createElement('button'); b3.className='modal-item'; b3.textContent='Manage server files'; b3.onclick=()=>{ close(); openServerManageModal(); };
-  list.appendChild(b1); list.appendChild(b2); list.appendChild(b3);
+  const b2 = document.createElement('button'); b2.className='modal-item'; b2.textContent='Server files (load & manage)'; b2.onclick=()=>{ close(); openServerManageModal(); };
+  list.appendChild(b1); list.appendChild(b2);
 
   // CSV section below server buttons
   const sep = document.createElement('div'); sep.className='small'; sep.style.margin='8px 0 4px'; sep.style.opacity='0.8'; sep.textContent='Local CSV';
@@ -1457,34 +1456,143 @@ function openServerActionsMenu(){
 async function openServerManageModal(){
   let items=[]; try{ const j=await mqttOnceList(); items=(j.items||[]); }catch(e){ alert('Failed to reach backup server via MQTT.'); return; }
   if(!items.length){ alert('No recordings on server.'); return; }
+  // Derive dates from filenames or updated_at
+  function itemDateStr(it){
+    // Try to pick up YYYY-MM-DD from filename, else from updated_at
+    try{
+      const fn = (it.filename||it.id||'');
+      const m = fn.match(/(20\d{2}-\d{2}-\d{2})/);
+      if (m) return m[1];
+      if (it.updated_at) return (it.updated_at||'').slice(0,10);
+    }catch{}
+    return 'Unknown';
+  }
+  const byDate = {};
+  items.forEach(it=>{ const d=itemDateStr(it); if(!byDate[d]) byDate[d]=[]; byDate[d].push(it); });
+  const dates = Object.keys(byDate).sort();
+
   const overlay = document.createElement('div'); overlay.id='serverManageOverlay'; overlay.className='modal-overlay'; overlay.addEventListener('click', e=>{ if(e.target===overlay) close(); });
-  const dialog = document.createElement('div'); dialog.className='modal-dialog'; dialog.style.maxWidth='820px'; dialog.style.width='90%';
+  const dialog = document.createElement('div'); dialog.className='modal-dialog'; dialog.style.maxWidth='900px'; dialog.style.width='90%';
   const header = document.createElement('div'); header.className='modal-header';
-  const title = document.createElement('div'); title.className='modal-title'; title.textContent='Manage server files';
+  const title = document.createElement('div'); title.className='modal-title'; title.textContent= 'Server files';
   const closeBtn = document.createElement('button'); closeBtn.className='modal-close'; closeBtn.innerHTML='✕'; closeBtn.onclick=close;
   header.appendChild(title); header.appendChild(closeBtn);
   const body = document.createElement('div'); body.className='modal-content';
-  const table = document.createElement('div'); table.style.display='grid'; table.style.gridTemplateColumns='1fr auto auto'; table.style.gap='8px';
-  // Header row
-  table.appendChild(makeCell('File', true)); table.appendChild(makeCell('Rename', true)); table.appendChild(makeCell('Delete', true));
-  // Rows
-  items.forEach(it=>{
-    const label = it.label && it.label.trim()? it.label : (it.filename || it.id);
-    table.appendChild(makeCell(label));
-    const rn = document.createElement('button'); rn.className='small'; rn.textContent='Rename'; rn.onclick=async()=>{ await renameItem(it.id, label); await refresh(); };
-    const del = document.createElement('button'); del.className='small'; del.textContent='Delete'; del.onclick=async()=>{ if(confirm('Delete this file from server?')){ await deleteItem(it.id); await refresh(); } };
-    table.appendChild(rn); table.appendChild(del);
-  });
+
+  // Date selector
+  const controls = document.createElement('div'); controls.style.display='flex'; controls.style.gap='8px'; controls.style.alignItems='center'; controls.style.marginBottom='10px';
+  const lab = document.createElement('label'); lab.className='small'; lab.textContent='Select date:'; controls.appendChild(lab);
+  const sel = document.createElement('select'); dates.forEach(d=>{ const o=document.createElement('option'); o.value=d; o.textContent=d; sel.appendChild(o); }); controls.appendChild(sel);
+  body.appendChild(controls);
+
+  // Container for table
+  const table = document.createElement('div'); table.style.display='grid'; table.style.gridTemplateColumns= 'auto 1fr auto auto auto'; table.style.gap='8px';
   body.appendChild(table);
+
+  // Footer actions (load selected)
+  const footer = document.createElement('div'); footer.style.display='flex'; footer.style.justifyContent='flex-end'; footer.style.gap='8px'; footer.style.marginTop='12px';
+  const loadBtn = document.createElement('button'); loadBtn.className='small'; loadBtn.textContent='Load selected'; loadBtn.onclick=async()=>{
+    const checks = table.querySelectorAll('input[type="checkbox"][data-id]:checked');
+    if (!checks.length){ alert('Select one or more files to load.'); return; }
+    // Load sequentially with progress banner
+    const statusId = 'downloadStatusBanner';
+    let banner = document.getElementById(statusId);
+    if (!banner) { banner = document.createElement('div'); banner.id=statusId; Object.assign(banner.style,{position:'fixed',right:'12px',bottom:'12px',zIndex:'9999',background:'rgba(0,0,0,0.8)',color:'#fff',padding:'10px 12px',borderRadius:'8px',fontSize:'12px',boxShadow:'0 2px 10px rgba(0,0,0,0.3)'}); banner.textContent='Preparing downloads…'; document.body.appendChild(banner);} 
+    const setText=(t)=>{ try{ banner.textContent=t; }catch{} };
+    for (let i=0;i<checks.length;i++){
+      const id = checks[i].getAttribute('data-id');
+      const label = checks[i].getAttribute('data-label')||id;
+      try{
+        setText(`Loading ${i+1}/${checks.length}: ${label}…`);
+        const { text } = await mqttDownloadCsv(id, (p)=>{ if(p&&p.phase==='chunk'&&p.percent!=null) setText(`Loading ${i+1}/${checks.length}: ${label} — ${p.percent}%`); });
+        const rec = parseCsvTextToRecording(text, id||'server.csv');
+        if (!rec || !rec.rows || rec.rows.length===0){ continue; }
+        try{ rec._hash = await computeSHA256Hex(text); }catch{}
+        if (shouldSkipDuplicate(rec)){
+          const proceed = confirm('This CSV matches an existing report. Import anyway?');
+          if (!proceed) continue;
+        }
+        // Optional name prompt per file
+        try{
+          const suggested = id.replace(/\.csv$/i,'');
+          const newName = prompt('Name this report (optional):', suggested);
+          if (newName!=null && String(newName).trim()) rec.label = String(newName).trim();
+        }catch{}
+        allRecordings.push(rec);
+      }catch(e){ /* skip */ }
+    }
+    if (typeof saveRecordingsToStorage==='function') saveRecordingsToStorage();
+    generateReportsTabs();
+    try{ banner.style.transition='opacity 0.6s'; banner.style.opacity='0'; setTimeout(()=>{ try{ banner.remove(); }catch{} }, 700); }catch{}
+    close();
+  };
+  footer.appendChild(loadBtn);
+  body.appendChild(footer);
+
+  function renderTable(date){
+    table.innerHTML='';
+    // Unified header: checkbox + file + size + actions
+    table.appendChild(makeCell('', true));
+    table.appendChild(makeCell('File', true));
+    table.appendChild(makeCell('Size', true));
+    table.appendChild(makeCell('Rename', true));
+    table.appendChild(makeCell('Delete', true));
+    (byDate[date]||[]).forEach(it=>{
+      const label = it.label && it.label.trim()? it.label : (it.filename || it.id);
+      const cb = document.createElement('input'); cb.type='checkbox'; cb.setAttribute('data-id', it.id||it.filename); cb.setAttribute('data-label', label);
+      table.appendChild(cb);
+      // File cell: show name only (per-row Load removed)
+      const fileCell = document.createElement('div');
+      const nameSpan = document.createElement('span'); nameSpan.textContent = label; fileCell.appendChild(nameSpan);
+      table.appendChild(fileCell);
+      table.appendChild(makeCell((it.size_bytes!=null? (Math.round(it.size_bytes/1024)+' KB') : '-')));
+      const rn = document.createElement('button'); rn.className='small'; rn.textContent='Rename'; rn.onclick=async()=>{ await renameItem(it.id, label); await refresh(date); };
+      const del = document.createElement('button'); del.className='small'; del.textContent='Delete'; del.onclick=async()=>{ if(confirm('Delete this file from server?')){ await deleteItem(it.id); await refresh(date); } };
+      table.appendChild(rn); table.appendChild(del);
+    });
+  }
+  renderTable(dates[0]);
+  sel.onchange = ()=> renderTable(sel.value);
+
   dialog.appendChild(header); dialog.appendChild(body); overlay.appendChild(dialog); document.body.appendChild(overlay);
 
-  async function refresh(){ try{ overlay.remove(); }catch{} openServerManageModal(); }
+  async function refresh(dateSel){ try{ overlay.remove(); }catch{} openServerManageModal(); }
   function close(){ const ov=document.getElementById('serverManageOverlay'); if(ov&&ov.parentElement){ try{ ov.remove(); }catch{} } }
   function makeCell(text, header=false){ const d=document.createElement('div'); d.textContent=text; d.className= header? 'small' : ''; return d; }
   async function deleteItem(id){ try{ await mqttOnceDelete(id); }catch{} }
   async function renameItem(id, current){
     const name = prompt('Enter new label for this file:', current || ''); if(!name || !name.trim()) return;
     try{ await mqttOnceUpdate(id, name.trim()); }catch{ alert('Rename failed'); }
+  }
+  async function loadItem(it){
+    const id = it.id || it.filename;
+    if (!id) return;
+    // Show a small progress banner
+    const statusId = 'downloadStatusBanner';
+    let banner = document.getElementById(statusId);
+    if (!banner) { banner = document.createElement('div'); banner.id=statusId; Object.assign(banner.style,{position:'fixed',right:'12px',bottom:'12px',zIndex:'9999',background:'rgba(0,0,0,0.8)',color:'#fff',padding:'10px 12px',borderRadius:'8px',fontSize:'12px',boxShadow:'0 2px 10px rgba(0,0,0,0.3)'}); document.body.appendChild(banner);} 
+    const setText=(t)=>{ try{ banner.textContent=t; }catch{} };
+    try{
+      const disp = (it.label && it.label.trim()) ? it.label : (it.filename || it.id);
+      setText(`Loading: ${disp}…`);
+      const { text } = await mqttDownloadCsv(id, (p)=>{ if(p&&p.phase==='chunk'&&p.percent!=null) setText(`Loading: ${disp} — ${p.percent}%`); });
+      const rec = parseCsvTextToRecording(text, id||'server.csv');
+      if (!rec || !rec.rows || rec.rows.length===0) return;
+      try{ rec._hash = await computeSHA256Hex(text); }catch{}
+      if (shouldSkipDuplicate(rec)){
+        const proceed = confirm('This CSV matches an existing report. Import anyway?');
+        if (!proceed) return;
+      }
+      try{
+        const suggested = (id||'').replace(/\.csv$/i,'');
+        const newName = prompt('Name this report (optional):', suggested);
+        if (newName!=null && String(newName).trim()) rec.label = String(newName).trim();
+      }catch{}
+      allRecordings.push(rec);
+      if (typeof saveRecordingsToStorage==='function') saveRecordingsToStorage();
+      generateReportsTabs();
+    }catch(e){ /* ignore */ }
+    finally { try{ banner.style.transition='opacity 0.6s'; banner.style.opacity='0'; setTimeout(()=>{ try{ banner.remove(); }catch{} }, 700); }catch{} }
   }
 }
 
