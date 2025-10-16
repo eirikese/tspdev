@@ -1355,7 +1355,8 @@ async function openServerLoadModal(){
         }
         // Prompt for custom name after load
         try{
-          const suggested = (it.label && it.label.trim()) ? it.label.trim() : ((rec.label && rec.label.trim()) ? rec.label.trim() : ((it.filename||'').replace(/\.csv$/i,'')||''));
+          // Default to the exact label shown in the selection menu
+          const suggested = label;
           const newName = prompt('Name this report (optional):', suggested);
           if (newName!=null && String(newName).trim()) rec.label = String(newName).trim();
         }catch{}
@@ -1512,9 +1513,9 @@ async function openServerManageModal(){
           const proceed = confirm('This CSV matches an existing report. Import anyway?');
           if (!proceed) continue;
         }
-        // Optional name prompt per file
+        // Optional name prompt per file; default to the label shown in the selection menu
         try{
-          const suggested = id.replace(/\.csv$/i,'');
+          const suggested = label;
           const newName = prompt('Name this report (optional):', suggested);
           if (newName!=null && String(newName).trim()) rec.label = String(newName).trim();
         }catch{}
@@ -1584,7 +1585,8 @@ async function openServerManageModal(){
         if (!proceed) return;
       }
       try{
-        const suggested = (id||'').replace(/\.csv$/i,'');
+        // Default to display label used in the menu (disp)
+        const suggested = disp;
         const newName = prompt('Name this report (optional):', suggested);
         if (newName!=null && String(newName).trim()) rec.label = String(newName).trim();
       }catch{}
